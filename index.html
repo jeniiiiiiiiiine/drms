@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Butterfly Wishes</title>
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+#wish{position:fixed;z-index:5;width:min(300px,78vw);transform:translate(-50%,-100%) scale(.7);opacity:0;pointer-events:none;padding:16px 20px 18px;border-radius:18px;text-align:center;color:#fff4ff;font:italic 19px/1.4 Georgia,'Palatino Linotype',serif;background:linear-gradient(160deg,rgba(120,70,190,.55),rgba(30,20,70,.65));border:1px solid rgba(255,220,255,.45);box-shadow:0 0 34px rgba(190,140,255,.55),inset 0 0 22px rgba(255,200,255,.15);-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);text-shadow:0 0 10px rgba(255,190,255,.7);transition:opacity .5s,transform .5s cubic-bezier(.2,1.4,.4,1)}
+#wish.on{opacity:1;transform:translate(-50%,-100%) scale(1)}
+#wish small{display:block;font:600 11px/1 system-ui,sans-serif;letter-spacing:.2em;text-transform:uppercase;color:#ffd9f7;margin-bottom:9px;opacity:.85}
+#wish p{margin:0}
+#count{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:4;color:rgba(255,230,255,.7);font:12px system-ui,sans-serif;letter-spacing:.12em;pointer-events:none;text-shadow:0 0 8px #a6f;white-space:nowrap}
+#header{position:fixed;top:calc(16px + env(safe-area-inset-top,0px));left:50%;transform:translateX(-50%);z-index:3;width:max-content;max-width:90vw;text-align:center;pointer-events:none;color:#f6e9ff;font:italic 600 30px/1.15 Georgia,'Palatino Linotype',serif;letter-spacing:.03em;text-shadow:0 0 14px rgba(190,140,255,.6)}
+#header small{display:block;margin-top:6px;font:11px system-ui,sans-serif;letter-spacing:.22em;text-transform:uppercase;opacity:.7}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="wish"><small>✦ a Birthday wish for Ahlem ✦</small><p></p></div><div id="count"></div>
+<div id="header">Happy Birthday, Ahlem</div>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* =====================================================================
+   BUTTERFLY WISHES
+   A flock of glowing fairy butterflies drifting through a twilight garden. Each one flaps, flutters,
+   and is drawn to the pointer's light or to drifting golden fairy dust. Tap or click a butterfly
+   and it bursts into sparkles while its very own fairy birthday wish floats up. Tap empty space to
+   sprinkle fairy dust. Find all the wishes!
+   ===================================================================== */
+
+const MOBILE = matchMedia('(pointer: coarse)').matches;
+const MAXC = 21, SEG = 14, CH = 24, FOOD = MOBILE ? 1700 : 2600, PLANK = MOBILE ? 12000 : 24000;
+const BOX = innerWidth < innerHeight ? new THREE.Vector3(5, 7, 5) : new THREE.Vector3(9, 4.8, 6);   // the swarm's home (half extents); tall on phones
+const TAU = Math.PI * 2, V3 = THREE.Vector3, UP = new V3(0, 1, 0);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const R = rng((Date.now() % 2147483647) | 0);      // a new reef on every visit
+const gauss = () => { let u = 0; while (!u) u = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * R()); };
+
+// ---------------------------------------------------------------- 1. setup
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
+const DPR = Math.min(window.devicePixelRatio || 1, MOBILE ? 1.5 : 1.75);
+renderer.setPixelRatio(DPR); renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 0.75;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene(), cam = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 300);
+const HUE = /* glsl */`vec3 hue(float h) { return clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0); }`;
+const FOG = /* glsl */`float fogOf(float z) { return exp(-max(z - 9.0, 0.0) * 0.045); }`;
+
+// ---------------------------------------------------------------- 2. water: dark gradient, light shafts, the surface far above
+const bgMat = new THREE.ShaderMaterial({
+  depthTest: false, depthWrite: false,
+  uniforms: { uTime: { value: 0 }, uCam: { value: new THREE.Matrix4() }, uTan: { value: new THREE.Vector2(1, 1) } },
+  vertexShader: `uniform mat4 uCam; uniform vec2 uTan; varying vec3 vDir;
+    void main() { vDir = (uCam * vec4(position.x * uTan.x, position.y * uTan.y, -1.0, 0.0)).xyz; gl_Position = vec4(position.xy, 0.9999, 1.0); }`,
+  fragmentShader: /* glsl */`uniform float uTime; varying vec3 vDir;
+    float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+    float n2(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f); return mix(mix(h21(i), h21(i + vec2(1, 0)), f.x), mix(h21(i + vec2(0, 1)), h21(i + vec2(1, 1)), f.x), f.y); }
+    float fbm(vec2 p) { float a = 0.5, s = 0.0; for (int i = 0; i < 4; i++) { s += a * n2(p); p = p * 2.03 + 11.7; a *= 0.5; } return s; }
+    void main() {
+      vec3 d = normalize(vDir); float up = d.y;
+      vec3 col = mix(vec3(0.0012, 0.0035, 0.011), vec3(0.004, 0.02, 0.046), smoothstep(-0.7, 0.25, up));
+      col = mix(col, vec3(0.018, 0.1, 0.15), smoothstep(0.15, 0.95, up));
+      float az = atan(d.x, d.z);
+      float sh = fbm(vec2(az * 7.0 + uTime * 0.025, uTime * 0.04)) * fbm(vec2(az * 15.0 - uTime * 0.02, 3.0 + uTime * 0.03));
+      col += vec3(0.05, 0.2, 0.24) * smoothstep(0.18, 0.5, sh) * smoothstep(-0.35, 0.8, up) * 0.5;
+      vec2 sp = d.xz / max(d.y + 0.25, 0.08);
+      col += vec3(0.16, 0.4, 0.44) * pow(max(up, 0.0), 6.0) * (0.45 + 0.55 * fbm(sp * 2.5 + vec2(uTime * 0.08, -uTime * 0.05)));
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+const bg = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), bgMat); bg.frustumCulled = false; bg.renderOrder = -10; scene.add(bg);
+
+// ---------------------------------------------------------------- 3. plankton (sparkle when disturbed) and marine snow (food)
+// Plankton are stateless: each point's drift is a function of time, and its glow comes from how
+// close it is to a moving animal or to the pointer's recent path, all inside the vertex shader.
+const plankU = { uTime: { value: 0 }, uPx: { value: 800 }, uBox: { value: new V3(13, 7, 9) },
+  uCre: { value: Array.from({ length: MAXC }, () => new THREE.Vector4()) }, uPtr: { value: Array.from({ length: 6 }, () => new THREE.Vector4()) } };
+{
+  const g = new THREE.BufferGeometry(), p = new Float32Array(PLANK * 3), s = new Float32Array(PLANK * 4);
+  for (let i = 0; i < PLANK; i++) { p.set([(R() * 2 - 1) * 13, (R() * 2 - 1) * 7, (R() * 2 - 1) * 9], i * 3); s.set([R(), R(), R(), R()], i * 4); }
+  g.setAttribute('position', new THREE.BufferAttribute(p, 3)); g.setAttribute('aSeed', new THREE.BufferAttribute(s, 4));
+  const m = new THREE.ShaderMaterial({ uniforms: plankU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: /* glsl */`uniform float uTime, uPx; uniform vec3 uBox; uniform vec4 uCre[${MAXC}]; uniform vec4 uPtr[6]; attribute vec4 aSeed; varying float vB;
+      ${FOG}
+      void main() {
+        vec3 p = position + vec3(sin(uTime * 0.07 + aSeed.x * 6.28), 0.6 * sin(uTime * 0.05 + aSeed.y * 6.28), cos(uTime * 0.06 + aSeed.z * 6.28)) * 0.6;
+        p.x = mod(p.x + uTime * 0.1 + uBox.x, 2.0 * uBox.x) - uBox.x;
+        float b = 0.0;
+        for (int i = 0; i < ${MAXC}; i++) { vec4 c = uCre[i]; if (c.w <= 0.0) continue; vec3 d = p - c.xyz; b += c.w * exp(-dot(d, d) * 0.8); }
+        for (int i = 0; i < 6; i++) { vec4 c = uPtr[i]; if (c.w <= 0.0) continue; vec3 d = p - c.xyz; b += c.w * exp(-dot(d, d) * 1.4); }
+        b = min(b, 3.0) * (0.5 + 0.5 * aSeed.w);
+        vec4 mv = modelViewMatrix * vec4(p, 1.0); float z = -mv.z;
+        vB = (0.03 * (0.5 + 0.5 * sin(uTime * (0.7 + aSeed.w * 2.5) + aSeed.x * 40.0)) + b) * fogOf(z);
+        gl_PointSize = clamp((0.035 + 0.045 * aSeed.w) * uPx / z * (1.0 + b), 1.0, 16.0);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `varying float vB; void main() { vec2 c = gl_PointCoord - 0.5; gl_FragColor = vec4(vec3(0.22, 0.72, 1.0) * vB * exp(-dot(c, c) * 12.0), 1.0); }` });
+  const pts = new THREE.Points(g, m); pts.frustumCulled = false; scene.add(pts);
+}
+// Marine snow lives on the CPU because the animals eat it. Far and near flakes swell into soft
+// discs (a cheap depth of field), flakes that are remains of the dead glow green for a while.
+const food = { p: new Float32Array(FOOD * 3), g: new Float32Array(FOOD), s: new Float32Array(FOOD) };
+const snowU = { uPx: { value: 800 }, uFocus: { value: 17 } };
+const respawnFood = (i, top) => { food.p[i * 3] = (R() * 2 - 1) * 12; food.p[i * 3 + 1] = top ? BOX.y + 1.5 + R() * 2 : (R() * 2 - 1) * (BOX.y + 2); food.p[i * 3 + 2] = (R() * 2 - 1) * 9; food.g[i] = 0; };
+for (let i = 0; i < FOOD; i++) { respawnFood(i, false); food.s[i] = R(); }
+const snowGeo = new THREE.BufferGeometry();
+snowGeo.setAttribute('position', new THREE.BufferAttribute(food.p, 3).setUsage(THREE.DynamicDrawUsage));
+snowGeo.setAttribute('aG', new THREE.BufferAttribute(food.g, 1).setUsage(THREE.DynamicDrawUsage));
+snowGeo.setAttribute('aS', new THREE.BufferAttribute(food.s, 1));
+{
+  const m = new THREE.ShaderMaterial({ uniforms: snowU, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: /* glsl */`uniform float uPx, uFocus; attribute float aG, aS; varying float vA, vG; ${FOG}
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0); float z = -mv.z;
+        float base = (0.028 + 0.04 * aS) * uPx / z, bok = clamp(abs(z - uFocus) * 0.5, 0.0, 9.0) * uPx / 1000.0, s = max(base + bok, 1.0);
+        gl_PointSize = s; vG = aG;
+        vA = (0.1 + 0.2 * aS) * clamp(base * base / (s * s), 0.015, 1.0) * fogOf(z) * (0.55 + 0.6 * smoothstep(-5.0, 6.0, position.y)) * (1.0 + aG * 5.0);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `varying float vA, vG; void main() { float r = length(gl_PointCoord - 0.5) * 2.0; gl_FragColor = vec4(mix(vec3(0.5, 0.62, 0.68), vec3(1.0, 0.82, 0.45), vG) * vA * smoothstep(1.0, 0.7, r), 1.0); }` });
+  const pts = new THREE.Points(snowGeo, m); pts.frustumCulled = false; scene.add(pts);
+}
+
+// ---------------------------------------------------------------- 4. butterflies
+const WISHES = [
+  "Happy birthday, Drms! May your day sparkle with pixie dust and endless laughter.",
+  "Ahlem, may this year be as magical as moonlight on a fairy ring.",
+  "A little fairy whispered that this will be your best year yet.",
+  "Ahlem, may every candle you blow out carry a dream straight to the stars.",
+  "Happy birthday, Ahlem! May your heart flutter with joy all year long.",
+  "Fairy blessings for you: courage, kindness and a sprinkle of mischief.",
+  "May the flowers bloom brighter wherever you wander this year, Ahlem.",
+  "The fairies baked you a wish, sweet, glittery and impossible to resist.",
+  "Another year of wonder begins. Spread your wings and fly",
+  "May dewdrops of happiness gather in every corner of your day.",
+  "Wishing you cake, cuddles and a thousand tiny miracles.",
+  "May your dreams grow wings and flutter into real life.",
+  "A circle of friends and a pocketful of stardust: that is my wish for you.",
+  "May the moon save you a dance and the stars sing you a lullaby tonight.",
+  "You make the whole world sparkle. Happy, happy birthday!",
+  "May every wish you whisper tonight be granted by morning light, Ahlem.",
+  "May your laughter ring like fairy bells all year long.",
+  "May every petal that falls today be a tiny kiss of luck for you.",
+  "Ahlem, the fairies say you deserve all the sweetness in the garden.",
+  "May your path be lit by fireflies and your heart be light as a wing.",
+  "Twenty-one little wishes, one for each butterfly: you are loved, Ahlem. Happy birthday!"];
+const GN = ['size', 'hue', 'hue2', 'freq', 'glow', 'photo', 'tail', 'spots', 'vein'];
+const G = Object.fromEntries(GN.map((n, i) => [n, i]));
+const RANGE = [[0.8, 1.3], [0, 1], [0, 1], [0.8, 1.5], [0.7, 1], [-0.4, 1], [0, 1], [0, 1], [0, 1]];
+const pickHue = () => [0.93, 0.76, 0.55, 0.41, 0.06, 0.15, 0.97, 0.62][(R() * 8) | 0] + (R() - 0.5) * 0.05;   // pastel pink, lavender, sky, mint, peach, lemon, rose, periwinkle
+function wildGenome() {
+  const g = new Float32Array(GN.length); RANGE.forEach(([a, b], i) => g[i] = a + (b - a) * R());
+  g[G.hue] = pickHue(); g[G.hue2] = (g[G.hue] + 0.22 + R() * 0.3) % 1; return g;
+}
+const ZERO = new V3(), ZAX = new V3(0, 0, 1), _m = new THREE.Matrix4(), _qz = new THREE.Quaternion(), _cd = new V3(), _up = new V3();
+
+class Fly {
+  constructor(g, pos, wish) {
+    Object.assign(this, { g, pos: pos.clone(), vel: new V3(), axis: new V3(gauss(), gauss() * 0.3, 0).normalize(), wish, phase: R() * TAU, seed: R(), think: R() * 0.5,
+      target: new V3(), hasTarget: false, q: new THREE.Quaternion(), stir: 0, boost: 0, visited: false, twirl: 0, alpha: 1, depth: (R() * 2 - 1) * BOX.y * 0.7 });
+  }
+  get scale() { return this.g[G.size]; }
+  update(dt, t, world) {
+    const g = this.g, want = this._w || (this._w = new V3()); want.set(0, 0, 0);
+    this.boost = Math.max(0, this.boost - dt * 0.5); this.twirl = Math.max(0, this.twirl - dt);
+    _cd.subVectors(cam.position, this.pos).normalize();
+    if ((this.think -= dt) <= 0) { this.think = 0.4 + R() * 0.3; this.hasTarget = world.nearFood(this.pos, 5, this.target); }
+    if (this.hasTarget) want.add(this.target.clone().sub(this.pos).normalize());
+    if (world.lure.w > 0.05) { const d = world.lure.clone().sub(this.pos), L = d.length(); if (L < 9) want.addScaledVector(d.normalize(), g[G.photo] * 1.6 * world.lure.w * (1 - L / 9)); }
+    for (const k of ['x', 'y', 'z']) { const e = Math.abs(this.pos[k]) - BOX[k]; if (e > 0) want[k] -= Math.sign(this.pos[k]) * e * 2.5; }
+    want.y += clamp((this.depth - this.pos.y) * 0.35, -1, 1);
+    want.x += Math.sin(t * 1.3 + this.seed * 30) * 0.5; want.z += Math.cos(t * 1.1 + this.seed * 20) * 0.5; want.y += Math.sin(t * 2.1 + this.seed * 10) * 0.4;   // erratic flutter
+    want.addScaledVector(_cd, -want.dot(_cd) * 0.85);              // stay mostly in the screen plane so the wings face us
+    if (want.lengthSq() > 1e-6) this.axis.lerp(want.normalize(), 1 - Math.exp(-1.6 * dt));
+    this.axis.addScaledVector(_cd, -this.axis.dot(_cd) * 0.5).normalize();
+    this.phase += dt * g[G.freq] * (this.twirl > 0 ? 1.8 : 1) * TAU * 1.2;
+    this.vel.addScaledVector(this.axis, (0.55 + 0.45 * Math.sin(this.phase)) * 1.1 * dt); this.vel.y += Math.cos(this.phase) * 0.5 * dt;
+    this.vel.multiplyScalar(Math.exp(-0.8 * dt));
+    world.flow(this.pos, t, this._f || (this._f = new V3()));
+    this.pos.addScaledVector(this.vel, dt).addScaledVector(this._f, dt);
+    _up.copy(_cd).multiplyScalar(0.9).addScaledVector(UP, 0.3); _m.lookAt(this.axis, ZERO, _up);
+    this.q.setFromRotationMatrix(_m).multiply(_qz.setFromAxisAngle(ZAX, Math.sin(this.phase * 0.5) * 0.15));
+    this.stir = (this.vel.length() * 0.8 + 0.25 + this.boost * 2) * this.scale;
+  }
+}
+
+// every butterfly is one instanced flat wing-plane: the vertex shader flaps it, the fragment shader paints wings, veins, spots, body and antennae
+const bellGeo = new THREE.PlaneGeometry(2, 2, 28, 18);
+const iG0 = new THREE.InstancedBufferAttribute(new Float32Array(MAXC * 4), 4), iG1 = new THREE.InstancedBufferAttribute(new Float32Array(MAXC * 4), 4), iS = new THREE.InstancedBufferAttribute(new Float32Array(MAXC * 4), 4);
+[iG0, iG1, iS].forEach((a, k) => { a.setUsage(THREE.DynamicDrawUsage); bellGeo.setAttribute(['iG0', 'iG1', 'iS'][k], a); });
+const bellU = { uTime: { value: 0 } };
+const bells = new THREE.InstancedMesh(bellGeo, new THREE.ShaderMaterial({
+  uniforms: bellU, transparent: true, depthWrite: false, blending: THREE.NormalBlending, side: THREE.DoubleSide,
+  vertexShader: /* glsl */`attribute vec4 iG0, iG1, iS; varying vec2 vP; varying vec4 vG0, vG1, vS; varying float vShade, vFog; ${FOG}
+    void main() {
+      vP = position.xy; float side = sign(position.x + 1e-5), px = abs(position.x);
+      float a = 0.2 + 0.75 * sin(iS.x) + 0.28 * px * cos(iS.x);                 // wing tips trail the flap
+      vec3 p = vec3(side * px * cos(a), px * sin(a), position.y), n = vec3(-side * sin(a), cos(a), 0.0);
+      vec4 wp = modelMatrix * instanceMatrix * vec4(p, 1.0);
+      vShade = 0.55 + 0.6 * abs(dot(normalize(mat3(modelMatrix) * mat3(instanceMatrix) * n), normalize(cameraPosition - wp.xyz)));
+      vG0 = iG0; vG1 = iG1; vS = iS;
+      vec4 mv = viewMatrix * wp; vFog = fogOf(-mv.z); gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */`uniform float uTime; varying vec2 vP; varying vec4 vG0, vG1, vS; varying float vShade, vFog; ${HUE}
+    float sdE(vec2 p, vec2 c, vec2 r, float a) { p -= c; float s = sin(a), k = cos(a); p = vec2(k * p.x + s * p.y, k * p.y - s * p.x); return (length(p / r) - 1.0) * min(r.x, r.y); }
+    float smn(float a, float b, float k) { float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0); return mix(b, a, h) - k * h * (1.0 - h); }
+    float seg(vec2 p, vec2 a, vec2 b) { vec2 pa = p - a, ba = b - a; return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0)); }
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    void main() {
+      vec2 p = vec2(abs(vP.x), vP.y); float T = vG1.x;
+      float fw = sdE(p, vec2(0.52, 0.34), vec2(0.58, 0.33), -0.62);                       // forewing: long, pointed tip
+      float hw = sdE(p, vec2(0.33, -0.38), vec2(0.31, 0.37), 0.2);                        // hindwing: rounder
+      float d = smn(fw, hw, 0.1);
+      d = smn(d, sdE(p, vec2(0.25, -0.6 - 0.18 * T), vec2(0.05, 0.04 + 0.18 * T), 0.2), 0.06);   // tail
+      d += 0.016 * sin(atan(p.y + 0.35, p.x) * 14.0) * smoothstep(0.0, -0.25, p.y);       // scalloped hindwing edge
+      float cov = smoothstep(0.012, -0.012, d);
+      vec3 c1 = mix(vec3(1.0), hue(vG0.x), 0.8), c2 = mix(vec3(1.0), hue(vG0.y), 0.7);
+      float ang = atan(p.y - 0.02, p.x + 0.02), r = length(p - vec2(0.02, 0.02));
+      vec3 col = mix(c1, c2, smoothstep(0.1, 0.9, r)) * (0.8 + 0.2 * hash(floor(p * 90.0)));      // wing scales
+      float vein = pow(abs(cos(ang * (8.0 + vG1.z * 6.0))), 40.0) * smoothstep(0.0, -0.05, d) * smoothstep(0.06, 0.2, r);
+      col = mix(col, vec3(0.06, 0.03, 0.05), vein * 0.8);                                   // dark veins
+      float edge = smoothstep(-0.15, -0.1, d);
+      col = mix(col, vec3(0.07, 0.04, 0.07), edge);                                         // dark wing margin
+      vec2 f = fract(p * 9.0 + 0.5) - 0.5;
+      col = mix(col, vec3(1.0, 0.97, 0.95), smoothstep(0.2, 0.13, length(f)) * smoothstep(-0.15, -0.12, d) * smoothstep(-0.03, -0.06, d) * step(0.2, vG1.y));   // white margin dots
+      float eye = length((p - vec2(0.34, -0.36)) / vec2(0.085, 0.085)) * step(0.45, vG1.y);       // hindwing eyespot
+      col = mix(col, vec3(0.06, 0.03, 0.05), smoothstep(1.0, 0.85, eye)); col = mix(col, c2 * 1.1, smoothstep(0.7, 0.55, eye)); col = mix(col, vec3(1.0), smoothstep(0.25, 0.1, length((p - vec2(0.36, -0.34)) / 0.03)) * step(0.45, vG1.y));
+      col *= mix(0.3, 1.0, smoothstep(0.02, 0.22, r));                                      // furry dark wing base
+      float bd = min(length(vec2(vP.x / 0.05, (vP.y - 0.02) / 0.46)), length(vec2(vP.x, vP.y - 0.47)) / 0.07);
+      float body = smoothstep(1.0, 0.85, bd);
+      vec3 bc = vec3(0.1, 0.06, 0.06) + 0.1 * step(0.5, fract(vP.y * 14.0)) * smoothstep(0.55, 0.1, bd);
+      float ant = smoothstep(0.014, 0.006, seg(p, vec2(0.02, 0.44), vec2(0.22, 0.84))) + smoothstep(0.03, 0.015, length(p - vec2(0.22, 0.84)));
+      vec3 outc = mix(col, bc, body); outc = mix(outc, vec3(0.08, 0.05, 0.06), clamp(ant, 0.0, 1.0));
+      float a = max(max(cov * 0.96, body), clamp(ant, 0.0, 1.0));
+      float lum = dot(outc, vec3(0.33)); outc = mix(outc, vec3(lum), vG1.w * 0.5) * mix(1.0, 0.4, vG1.w);   // visited butterflies fade and dim
+      gl_FragColor = vec4(outc * vG0.z * (0.55 + 0.45 * vShade) * (1.0 + vS.y * 0.2), a * vFog);
+    }`,
+}), MAXC);
+bells.frustumCulled = false; bells.count = 0; scene.add(bells);
+
+// ---------------------------------------------------------------- 5. the flock
+const animals = [];
+const pointer = { x: 0, y: 0, nx: 0, ny: 0, active: 0, trail: [], last: 0 };
+const world = {
+  lure: new THREE.Vector4(0, 0, 0, 0),
+  flow(p, t, out) { return out.set(Math.sin(p.y * 0.35 + t * 0.07) * 0.12 + 0.05, Math.sin(p.x * 0.3 + p.z * 0.2 + t * 0.05) * 0.05, Math.cos(p.x * 0.25 + t * 0.06) * 0.1); },
+  nearFood(pos, range, out) {   // the nearest glowing flake of fairy dust in range
+    let best = range * range, found = false;
+    for (let k = 0; k < 56; k++) {
+      const i = (R() * FOOD) | 0, dx = food.p[i * 3] - pos.x, dy = food.p[i * 3 + 1] - pos.y, dz = food.p[i * 3 + 2] - pos.z, d = (dx * dx + dy * dy + dz * dz) / (1 + food.g[i] * 3);
+      if (d < best) { best = d; found = true; out.set(food.p[i * 3], food.p[i * 3 + 1], food.p[i * 3 + 2]); }
+    }
+    return found;
+  },
+};
+const randomPos = () => new V3((R() * 2 - 1) * BOX.x * 0.8, (R() * 2 - 1) * BOX.y * 0.7, (R() * 2 - 1) * BOX.z * 0.8);
+const order = WISHES.map((_, i) => i).sort(() => R() - 0.5);      // every butterfly carries its own wish
+for (let i = 0; i < MAXC; i++) animals.push(new Fly(wildGenome(), randomPos(), WISHES[order[i % WISHES.length]]));
+
+function scatterFood(at, n, glow, spread) {
+  for (let k = 0; k < n; k++) {
+    const i = (R() * FOOD) | 0;
+    food.p[i * 3] = at.x + gauss() * spread; food.p[i * 3 + 1] = at.y + gauss() * spread; food.p[i * 3 + 2] = at.z + gauss() * spread; food.g[i] = glow;
+  }
+}
+const tmp = new V3();
+function ecosystem(dt, t) {
+  for (let i = 0; i < FOOD; i++) {
+    const j = i * 3; food.p[j + 1] -= (0.05 + 0.07 * food.s[i]) * dt; food.p[j] += Math.sin(t * 0.2 + food.s[i] * 40) * 0.03 * dt + 0.04 * dt;
+    if (food.g[i] > 0) food.g[i] = Math.max(0, food.g[i] - dt * 0.12);
+    if (food.p[j + 1] < -BOX.y - 3 || Math.abs(food.p[j]) > 13) respawnFood(i, true);
+  }
+  for (const a of animals) a.update(dt, t, world);
+  for (let i = 0; i < animals.length; i++) for (let k = i + 1; k < animals.length; k++) {
+    const A = animals[i], B = animals[k], d = tmp.subVectors(A.pos, B.pos), L = d.length(), m = 1.1 * (A.scale + B.scale);
+    if (L < m && L > 1e-4) { d.multiplyScalar((m - L) / L * 0.5 * dt); A.vel.add(d); B.vel.sub(d); }
+  }
+  for (let i = 0; i < FOOD; i++) {      // a butterfly that touches fairy dust glows for a moment
+    const x = food.p[i * 3], y = food.p[i * 3 + 1], z = food.p[i * 3 + 2];
+    for (const a of animals) { const dx = x - a.pos.x, dy = y - a.pos.y, dz = z - a.pos.z; if (dx * dx + dy * dy + dz * dz < a.scale * a.scale * 0.7) { a.boost = Math.min(1, a.boost + 0.12 + 0.4 * food.g[i]); respawnFood(i, true); break; } }
+  }
+}
+
+// upload everything the GPU needs for this frame
+const mat = new THREE.Matrix4(), sc = new V3();
+function upload(t) {
+  const n = animals.length; bells.count = n;
+  for (let i = 0; i < n; i++) {
+    const a = animals[i], g = a.g;
+    mat.compose(a.pos, a.q, sc.setScalar(a.scale)); bells.setMatrixAt(i, mat);
+    iG0.setXYZW(i, g[G.hue], g[G.hue2], g[G.glow], a.seed); iG1.setXYZW(i, g[G.tail], g[G.spots], g[G.vein], a.visited ? 1 : 0); iS.setXYZW(i, a.phase, a.boost, a.seed, 0);
+    plankU.uCre.value[i].set(a.pos.x, a.pos.y, a.pos.z, a.stir);      // fairy dust sparkles in their wake
+  }
+  for (let i = n; i < MAXC; i++) plankU.uCre.value[i].w = 0;
+  bells.instanceMatrix.needsUpdate = iG0.needsUpdate = iG1.needsUpdate = iS.needsUpdate = true;
+  snowGeo.attributes.position.needsUpdate = snowGeo.attributes.aG.needsUpdate = true;
+}
+
+// ---------------------------------------------------------------- the pointer: a lure of light, a wake of sparks, food on click
+const ray = new THREE.Raycaster(), plane = new THREE.Plane(), hit = new V3(), centre = new V3();
+function pointerWorld(cx, cy, out) {
+  ray.setFromCamera(new THREE.Vector2(cx / innerWidth * 2 - 1, -(cy / innerHeight) * 2 + 1), cam);
+  plane.setFromNormalAndCoplanarPoint(cam.getWorldDirection(tmp).negate(), centre);
+  return ray.ray.intersectPlane(plane, out) ? out : null;
+}
+addEventListener('pointermove', e => {
+  pointer.nx = e.clientX / innerWidth * 2 - 1; pointer.ny = e.clientY / innerHeight * 2 - 1; pointer.active = 1;
+  const p = pointerWorld(e.clientX, e.clientY, hit); if (!p) return;
+  world.lure.set(p.x, p.y, p.z, 1);
+  const now = performance.now(); if (now - pointer.last > 60) { pointer.last = now; pointer.trail.unshift(new THREE.Vector4(p.x, p.y, p.z, 1.4)); pointer.trail.length = Math.min(pointer.trail.length, 6); }
+});
+addEventListener('pointerdown', e => {
+  hideWish();
+  const f = innerHeight / (2 * Math.tan(cam.fov * Math.PI / 360)); let best = null, bd = 1e9;
+  for (const a of animals) { const s = a.pos.clone().project(cam), sx = (s.x + 1) / 2 * innerWidth, sy = (1 - s.y) / 2 * innerHeight, r = a.scale * 1.15 * f / cam.position.distanceTo(a.pos) + 14, d = Math.hypot(sx - e.clientX, sy - e.clientY); if (d < r && d < bd) { bd = d; best = [a, sx, sy]; } }
+  if (best) return showWish(...best);
+  const p = pointerWorld(e.clientX, e.clientY, hit); if (p) { scatterFood(p, 90, 0.8, 0.6); pointer.trail.unshift(new THREE.Vector4(p.x, p.y, p.z, 3)); pointer.trail.length = Math.min(pointer.trail.length, 6); }
+});
+// clicking a butterfly: it bursts into fairy dust and its own birthday wish floats up
+const card = document.getElementById('wish'), cnt = document.getElementById('count'), found = new Set(); let hideT = 0;
+cnt.textContent = '\u2726 tap a butterfly for a fairy wish \u2726';
+function hideWish() { card.classList.remove('on'); }
+function showWish(a, sx, sy) {
+  card.querySelector('p').textContent = a.wish; found.add(a.wish); cnt.textContent = '\u2726 ' + found.size + ' / ' + animals.length + ' wishes found \u2726';
+  card.style.left = clamp(sx, 160, innerWidth - 160) + 'px'; card.style.top = Math.max(sy - a.scale * 40 - 10, 230) + 'px';
+  card.classList.remove('on'); void card.offsetWidth; card.classList.add('on');
+  a.visited = true; a.boost = 0.3; a.twirl = 2; scatterFood(a.pos, 70, 1, 0.7 * a.scale);
+  pointer.trail.unshift(new THREE.Vector4(a.pos.x, a.pos.y, a.pos.z, 3)); pointer.trail.length = Math.min(pointer.trail.length, 6);
+  clearTimeout(hideT); hideT = setTimeout(hideWish, 7000);
+}
+addEventListener('pointerleave', () => { pointer.active = 0; });
+
+// ---------------------------------------------------------------- 6. loop
+const composer = new EffectComposer(renderer);
+const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.3, 0.4, 0.2);
+const grade = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `uniform sampler2D tDiffuse; uniform float uTime; varying vec2 vUv;
+    float hash(vec2 p) { p = fract(p * vec2(443.897, 441.423)); p += dot(p, p.yx + 19.19); return fract((p.x + p.y) * p.x); }
+    void main() { vec2 c = vUv - 0.5; float r2 = dot(c, c); vec2 o = c * r2 * 0.012;
+      vec3 col = vec3(texture2D(tDiffuse, vUv + o).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - o).b);
+      col *= 1.0 - 0.6 * smoothstep(0.1, 0.6, r2); col += (hash(vUv * 1024.0 + fract(uTime) * 77.0) - 0.5) * 0.018;
+      gl_FragColor = vec4(col, 1.0); }` });
+[new RenderPass(scene, cam), bloom, new OutputPass(), grade].forEach(p => composer.addPass(p));
+function resize() {
+  renderer.setSize(innerWidth, innerHeight); composer.setPixelRatio(DPR); composer.setSize(innerWidth, innerHeight);
+  cam.aspect = innerWidth / innerHeight; cam.fov = cam.aspect < 1 ? 62 : 42; cam.updateProjectionMatrix();
+  const px = innerHeight * DPR / (2 * Math.tan(cam.fov * Math.PI / 360)); plankU.uPx.value = snowU.uPx.value = px;
+}
+addEventListener('resize', resize); resize();
+
+let t = 0, last = performance.now();
+function updateCamera(dt) {   // drift with the swarm, never quite still
+  const mid = new V3(); let w = 0;
+  for (const a of animals) { mid.addScaledVector(a.pos, a.alpha); w += a.alpha; }
+  if (w > 0) mid.multiplyScalar(1 / w); mid.clamp(new V3(-4, -2, -3), new V3(4, 2, 3));
+  centre.lerp(mid, 1 - Math.exp(-0.25 * dt));
+  const portrait = cam.aspect < 1, yaw = 0.45 * Math.sin(t * 0.021) + pointer.nx * 0.1 * pointer.active, pitch = 0.1 + 0.07 * Math.sin(t * 0.033) + pointer.ny * 0.05 * pointer.active;
+  const dist = portrait ? 21 : 17;
+  cam.position.set(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)).multiplyScalar(dist).add(centre);
+  cam.lookAt(centre); cam.updateMatrixWorld();
+  snowU.uFocus.value = dist;
+}
+function step(dt) {
+  t += dt;
+  ecosystem(dt, t);
+  world.lure.w = Math.max(0, world.lure.w - dt * 0.35);
+  for (const p of pointer.trail) p.w = Math.max(0, p.w - dt * 1.6);
+  pointer.trail.forEach((p, i) => plankU.uPtr.value[i].copy(p)); for (let i = pointer.trail.length; i < 6; i++) plankU.uPtr.value[i].w = 0;
+  updateCamera(dt);
+}
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now(), dt = Math.min((now - last) / 1000, 0.05); last = now;
+  step(dt);
+  upload(t);
+  bgMat.uniforms.uTime.value = plankU.uTime.value = bellU.uTime.value = grade.uniforms.uTime.value = t;
+  bgMat.uniforms.uCam.value.copy(cam.matrixWorld); bgMat.uniforms.uTan.value.set(Math.tan(cam.fov * Math.PI / 360) * cam.aspect, Math.tan(cam.fov * Math.PI / 360));
+  composer.render();
+}
+for (let i = 0; i < 240; i++) step(1 / 60);    // let the tentacles settle before the first frame
+requestAnimationFrame(frame);
+window.__pelagia = { animals, step, world, cam, food, G };
+</script>
+</body>
+</html>
